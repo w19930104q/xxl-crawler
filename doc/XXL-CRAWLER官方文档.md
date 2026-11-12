@@ -238,15 +238,38 @@ public abstract void parse(Document html, Element pageVoElement, T pageVo) | 必
 ### 3.10、分布式支持 & RunUrlPool
 支持自定义RunUrlPool(运行时数据模型)并结合Redis或DB共享运行数据来实现分布式爬虫。默认提供LocalRunUrlPool实现单机版爬虫。
 
-- RunUrlPool：运行时数据模型，维护爬虫运行时的URL和白名单规则。
+- RunUrlPool：运行时数据模型，维护爬虫运行时的URL、白名单规则，以及URL生命周期原子状态机。
     - 单机：单机方式维护爬虫运行数据，默认提供 "LocalRunUrlPool" 的单机版实现。
     - 分布式/集群：集群方式维护爬虫爬虫运行数据，可通过Redis或DB定制实现。
 
-RunUrlPool抽象方法 | 说明
+URL在一次运行中由池统一管理，经历四态原子流转，爬虫线程只认领与结算、不直接维护任何URL集合：
+
+```
+ addUrl              claimUrl              retryUrl (重试额度内)
+(none) ---> QUEUED ------------> IN_FLIGHT ----------------------> QUEUED
+              ^                    |   |
+              | releaseUrl(停止)   |   | succeedUrl
+              +--------------------+   v
+                                   SUCCEEDED（终态，相同规范化URL不再抓取）
+                                   |
+                                   | retryUrl (额度耗尽) / failUrl
+                                   v
+                                 FAILED（终态，不丢失、不再抓取）
+```
+
+RunUrlPool 抽象方法 | 说明
 --- | ---
-public abstract boolean addUrl(String link); | 新增一个待采集的URL，接口需要做URL去重，爬虫线程将会获取到并进行处理；
-public abstract String getUrl(); | 获取一个待采集的URL，并且将它从"待采集URL池"中移除，并且添加到"已采集URL池"中；
-public abstract int getUrlNum(); | 获取待采集URL数量；
+public abstract boolean addUrl(String url, boolean validUrlRegex); | 新增URL并按白名单校验；任意状态（queued/in-flight/succeeded/failed）下相同规范化URL都原子去重，只允许入队一次；
+public abstract String claimUrl(); | 认领一个QUEUED的URL，原子转为IN_FLIGHT；池空时阻塞，停止/中断返回null；
+public abstract void succeedUrl(String url); | 认领URL成功结算，IN_FLIGHT -> SUCCEEDED终态；
+public abstract boolean retryUrl(String url, int failRetryCount); | 失败结算：按failRetryCount（总尝试=failRetryCount+1）决定原子重排回QUEUED或置FAILED终态，返回是否重排；
+public abstract void failUrl(String url); | 直接置FAILED终态；
+public abstract void releaseUrl(String url); | 停止/中断时释放认领，IN_FLIGHT -> QUEUED，在途页不丢失、不卡死，可被后续运行重新认领；
+public void shutdown(); | 唤醒阻塞在claimUrl的线程并禁止再次阻塞，停止时由XxlCrawler调用；
+public abstract int getUrlNum(); | 获取QUEUED待认领URL数量；
+public abstract int getInFlightNum(); | 获取IN_FLIGHT在途URL数量；
+public int getSucceededNum()/getFailedNum(); | 获取成功/失败终态数量（可选统计，默认-1）；
+public boolean isDone(); | 是否全部结算（无QUEUED且无IN_FLIGHT），用于运行结束判定；
 
 ### 3.11、JS动态渲染 & PageLoader
 页面数据通过 "PageLoader" 组件加载，默认使用以下两种实现：

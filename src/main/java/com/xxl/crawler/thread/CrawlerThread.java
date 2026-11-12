@@ -4,9 +4,9 @@ import com.xxl.crawler.XxlCrawler;
 import com.xxl.crawler.annotation.PageFieldSelect;
 import com.xxl.crawler.annotation.PageSelect;
 import com.xxl.crawler.constant.SelectType;
-import com.xxl.crawler.exception.XxlCrawlerException;
 import com.xxl.crawler.pageloader.param.Request;
 import com.xxl.crawler.pageloader.param.Response;
+import com.xxl.crawler.rundata.RunUrlPool;
 import com.xxl.crawler.util.ClawlerReflectionUtil;
 import com.xxl.crawler.util.JsoupUtil;
 import com.xxl.tool.http.HttpTool;
@@ -29,6 +29,10 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * crawler thread
+ *
+ * <p>线程仅负责从 {@link RunUrlPool} 认领 URL（claim）并在处理结束后结算
+ * （succeed/retry/fail/release），不直接维护任何 URL 集合；
+ * 失败重试由池根据 failRetryCount 原子重排，停止/中断时释放认领，避免在途页丢失或卡死。</p>
  *
  * @author xuxueli 2017-10-10 10:58:19
  */
@@ -54,63 +58,88 @@ public class CrawlerThread implements Runnable {
     public void run() {
 
         while (!toStop) {
+            String link = null;
             try {
 
                 // cycle run, check if stop
                 running = false;
                 crawler.tryFinish();
 
-                // tail url, will block if empty
-                String link = crawler.getRunUrlPool().getUrl();
+                // claim url, blocks until a QUEUED url is available; null on interrupt/shutdown
+                RunUrlPool urlPool = crawler.getRunUrlPool();
+                link = urlPool.claimUrl();
+                if (link == null) {
+                    break;      // interrupted or pool shutdown, exit gracefully
+                }
 
                 // process url
                 running = true;
                 if (!(HttpTool.isHttp(link) || HttpTool.isHttps(link))) {
+                    urlPool.failUrl(link);
                     continue;
                 }
 
-                // process with failcount
                 logger.info(">>>>>>>>>>> xxl crawler, process link : {}", link);
-                int runCount = crawler.getRunConf().getFailRetryCount() + 1;
-                for (int i = 0; i < runCount; i++) {
 
-                    Response response = null;
+                // single attempt; retry/requeue is decided atomically by the pool
+                Response response = null;
+                boolean interrupted = false;
+                try {
+                    // build request
+                    Request request = buildRequest(link);
+
+                    // 1、pre-parse
+                    crawler.getRunConf().getPageParser().preParse(request);
+
+                    // 2、load and parse
+                    response = loadAndParsePage(request);
+
+                    // 3、after-parse
+                    if (response.isSuccess()) {
+                        crawler.getRunConf().getPageParser().afterParse(response);
+                    } else {
+                        crawler.getRunConf().getPageParser().afterParseFail(response);
+                    }
+                } catch (Throwable e) {
+                    logger.error(">>>>>>>>>>> xxl crawler process error.", e);
+                }
+
+                // rate-limit pause, interruption releases the claim instead of losing the url
+                if (crawler.getRunConf().getPauseMillis() > 0) {
                     try {
-                        // build request
-                        Request request = buildRequest(link);
-
-                        // 1、pre-parse
-                        crawler.getRunConf().getPageParser().preParse(request);
-
-                        // 2、load and parse
-                        response = loadAndParsePage(request);
-
-                        // 3、after-parse
-                        if (response.isSuccess()) {
-                            crawler.getRunConf().getPageParser().afterParse(response);
-                        } else {
-                            crawler.getRunConf().getPageParser().afterParseFail(response);
-                        }
-                    } catch (Throwable e) {
-                        logger.error(">>>>>>>>>>> xxl crawler proocess error.", e);
-                    }
-                    if (crawler.getRunConf().getPauseMillis() > 0) {
-                        try {
-                            TimeUnit.MILLISECONDS.sleep(crawler.getRunConf().getPauseMillis());
-                        } catch (InterruptedException e) {
-                            logger.error(">>>>>>>>>>> xxl crawler thread is interrupted. {}", e.getMessage());
-                        }
-                    }
-                    if (response!=null && response.isSuccess()) {
-                        break;
+                        TimeUnit.MILLISECONDS.sleep(crawler.getRunConf().getPauseMillis());
+                    } catch (InterruptedException e) {
+                        interrupted = true;
+                        logger.warn(">>>>>>>>>>> xxl crawler thread interrupted while pause, release claim: {}", link);
                     }
                 }
 
-            } catch (Throwable e) {
-                if (e instanceof XxlCrawlerException) {
-                    logger.error(">>>>>>>>>>> xxl crawler thread {}", e.getMessage(), e);
+                // settle the claim, every in-flight url reaches exactly one terminal action
+                if (interrupted || Thread.currentThread().isInterrupted()) {
+                    urlPool.releaseUrl(link);
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+                if (response != null && response.isSuccess()) {
+                    urlPool.succeedUrl(link);
                 } else {
-                    logger.error(e.getMessage(), e);
+                    // pool requeues while retry budget remains, otherwise marks FAILED (no url lost)
+                    urlPool.retryUrl(link, crawler.getRunConf().getFailRetryCount());
+                }
+
+            } catch (Throwable e) {
+                logger.error(e.getMessage(), e);
+                // defensive settle: never leave an in-flight claim stuck
+                if (link != null) {
+                    try {
+                        if (Thread.currentThread().isInterrupted()) {
+                            crawler.getRunUrlPool().releaseUrl(link);
+                            break;
+                        }
+                        crawler.getRunUrlPool().retryUrl(link, crawler.getRunConf().getFailRetryCount());
+                    } catch (Throwable ignore) {
+                        logger.warn(">>>>>>>>>>> xxl crawler settle after error failed, url: {}", link);
+                    }
                 }
             }
 

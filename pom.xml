@@ -84,6 +84,16 @@
 
     <build>
         <plugins>
+            <!-- test runner; skipped by default (maven.test.skip=true), enable with -Dmaven.test.skip=false -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.5.3</version>
+                <configuration>
+                    <skipTests>${maven.test.skip}</skipTests>
+                    <testFailureIgnore>false</testFailureIgnore>
+                </configuration>
+            </plugin>
         </plugins>
     </build>
 

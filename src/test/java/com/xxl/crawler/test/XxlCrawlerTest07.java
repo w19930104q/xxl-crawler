@@ -30,48 +30,116 @@ public class XxlCrawlerTest07 {
         /**
          * 1、Redis RunUrlPool 构建：通过Redis共享运行数据来实现分布式爬虫，也可以通过其他方式扩展实现，如DB等。（以伪代码进行讲解）
          *
-         * 申请两个 Redis Key：
-         *      a、unVisitedUrl：待采集URL池
-         *      b、visitedUrl：已采集URL池
+         * 申请以下 Redis 结构，承载 URL 原子状态机（queued/in-flight/succeeded/failed）：
+         *      a、queue：List，QUEUED 状态URL，FIFO 待采集
+         *      b、state：Hash，规范化URL -> 状态（queued/in-flight/succeeded/failed），承担全局去重
+         *      c、attempt：Hash，规范化URL -> 已尝试次数，用于 failRetryCount 重排
+         * 所有流转（claim/retry/succeed/fail/release）需通过 Lua 脚本保证原子性。
          */
         RunUrlPool redisRunData = new RunUrlPool() {
 
             /**
-             * 新增一个待采集的URL，接口需要做URL去重，爬虫线程将会获取到并进行处理；
-             * @param url
+             * 新增一个待采集的URL；state 中已存在任意状态（含 succeeded/failed）都拒绝，全局原子去重。
              */
             @Override
             public boolean addUrl(String url, boolean validUrlRegex){
                 /**
-                 * TODO：
-                 *      jedis.lpushx(unVisitedUrl, link);
+                 * TODO（Lua 原子执行）：
+                 *      if redis.call('HGET', state, key) then return 0 end
+                 *      redis.call('HSET', state, key, 'queued')
+                 *      redis.call('RPUSH', queue, key)
                  */
                 throw new XxlCrawlerException("not support.");
             }
 
             /**
-             * 获取一个待采集的URL，并且将它从"待采集URL池"中移除，并且添加到"已采集URL池"中；
+             * 认领一个URL，原子地 queued -> in-flight；queue 为空时阻塞等待，shutdown 时返回 null。
              */
             @Override
-            public String getUrl() {
+            public String claimUrl() {
                 /**
-                 * TODO:
-                 *      String link = jedis.rpop(unVisitedUrl);
-                 *      jedis.lpushx(visitedUrl, link);
-                 *      return link;
+                 * TODO（BLPOP + Lua 原子流转）：
+                 *      local key = redis.call('BLPOP', queue, timeout)
+                 *      redis.call('HSET', state, key, 'in-flight')
+                 *      redis.call('HINCRBY', attempt, key, 1)
+                 *      return originUrl
                  */
                 throw new XxlCrawlerException("not support.");
             }
 
             /**
-             * 获取待采集URL数量；
+             * in-flight -> succeeded（终态），相同规范化URL不再抓取。
+             */
+            @Override
+            public void succeedUrl(String url) {
+                /**
+                 * TODO: redis.call('HSET', state, key, 'succeeded')
+                 */
+                throw new XxlCrawlerException("not support.");
+            }
+
+            /**
+             * 失败结算：尝试次数未达 failRetryCount+1 时原子重排回 queue，否则置 failed 终态。
+             */
+            @Override
+            public boolean retryUrl(String url, int failRetryCount) {
+                /**
+                 * TODO（Lua 原子执行）：
+                 *      local attempts = redis.call('HGET', attempt, key)
+                 *      if tonumber(attempts) < failRetryCount + 1 then
+                 *          redis.call('HSET', state, key, 'queued')
+                 *          redis.call('RPUSH', queue, key)
+                 *          return 1
+                 *      else
+                 *          redis.call('HSET', state, key, 'failed')
+                 *          return 0
+                 *      end
+                 */
+                throw new XxlCrawlerException("not support.");
+            }
+
+            /**
+             * in-flight -> failed（终态）。
+             */
+            @Override
+            public void failUrl(String url) {
+                /**
+                 * TODO: redis.call('HSET', state, key, 'failed')
+                 */
+                throw new XxlCrawlerException("not support.");
+            }
+
+            /**
+             * 停止/中断时释放认领：in-flight -> queued，在途页不丢失、不卡死，可被后续运行重新认领。
+             */
+            @Override
+            public void releaseUrl(String url) {
+                /**
+                 * TODO:
+                 *      redis.call('HSET', state, key, 'queued')
+                 *      redis.call('RPUSH', queue, key)
+                 */
+                throw new XxlCrawlerException("not support.");
+            }
+
+            /**
+             * 获取待采集（QUEUED）URL数量。
              */
             @Override
             public int getUrlNum() {
                 /**
-                 * TODO:
-                 *      int length = jedis.llen(unVisitedUrl);
-                 *      return length;
+                 * TODO: return redis.call('LLEN', queue)
+                 */
+                throw new XxlCrawlerException("not support.");
+            }
+
+            /**
+             * 获取在途（IN_FLIGHT）URL数量。
+             */
+            @Override
+            public int getInFlightNum() {
+                /**
+                 * TODO: 遍历 state 统计 in-flight
                  */
                 throw new XxlCrawlerException("not support.");
             }

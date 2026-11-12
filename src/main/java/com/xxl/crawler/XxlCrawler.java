@@ -338,7 +338,8 @@ public class XxlCrawler {
                 break;
             }
         }
-        boolean isEnd = runUrlPool.getUrlNum()==0 && !isRunning;
+        // finish only when the pool has neither queued nor in-flight urls and no thread is processing
+        boolean isEnd = runUrlPool.isDone() && !isRunning;
         if (isEnd) {
             //logger.info(">>>>>>>>>>> xxl crawler is finished.");
             stop();
@@ -349,10 +350,12 @@ public class XxlCrawler {
      * stop now
      */
     public void stop(){
+        // wake up threads blocked in claimUrl first, so the run can never hang
+        runUrlPool.shutdown();
         for (CrawlerThread crawlerThread: crawlerThreads) {
             crawlerThread.toStop();
         }
-        crawlers.shutdownNow();     // stop all thread now
+        crawlers.shutdownNow();     // interrupt all thread now; in-flight claims are released by threads
         logger.info(">>>>>>>>>>> xxl crawler stop.");
     }
 
